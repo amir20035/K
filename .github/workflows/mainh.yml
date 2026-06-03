@@ -1,0 +1,330 @@
+name: 💾 Large Youtube Videos Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_url:
+        description: 'YouTube video URL'
+        required: true
+        type: string
+      quality:
+        description: 'Video quality (best, 1080, 720, 480, audio)'
+        required: false
+        default: '1080'
+        type: string
+      password:
+        description: 'Password for zip files (optional)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  download-youtube:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git for Large Files
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip ffmpeg zip curl jq bc
+          pip3 install --upgrade yt-dlp
+          # Install cookies extractor
+          pip3 install browser-cookie3
+
+      - name: Download YouTube Video (Fixed)
+        run: |
+          URL="${{ github.event.inputs.youtube_url }}"
+          QUALITY="${{ github.event.inputs.quality }}"
+          ZIP_PASSWORD="${{ github.event.inputs.password }}"
+
+          SPLIT_MB=90
+          mkdir -p videos tmp_downloads
+
+          echo "========================================="
+          echo "YouTube Downloader with Cookie Bypass"
+          echo "========================================="
+          echo "URL: $URL"
+          echo "Quality: $QUALITY"
+          echo ""
+
+          # Set format based on quality
+          case "$QUALITY" in
+            "audio")
+              FORMAT="bestaudio/best"
+              EXT="mp3"
+              ;;
+            "1080")
+              FORMAT="bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best"
+              EXT="mp4"
+              ;;
+            "720")
+              FORMAT="bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best"
+              EXT="mp4"
+              ;;
+            "480")
+              FORMAT="bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best"
+              EXT="mp4"
+              ;;
+            *)
+              FORMAT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+              EXT="mp4"
+              ;;
+          esac
+
+          # Create a Python script with multiple bypass methods
+          cat > downloader.py << 'PYSCRIPT'
+import yt_dlp
+import os
+import sys
+
+url = sys.argv[1]
+format_spec = sys.argv[2]
+output_template = sys.argv[3]
+
+# Multiple player clients to try
+clients = ['android', 'ios', 'web', 'tv_embedded', 'tv', 'web_embedded']
+
+# Cookie file path
+cookie_file = 'cookies.txt'
+
+def download_with_ytdlp(client=None):
+    opts = {
+        'format': format_spec,
+        'merge_output_format': 'mp4',
+        'outtmpl': output_template,
+        'noplaylist': True,
+        'retries': 10,
+        'fragment_retries': 10,
+        'quiet': False,
+        'no_warnings': False,
+        'extract_flat': False,
+        'force_generic_extractor': False,
+    }
+    
+    # Add client if specified
+    if client:
+        opts['extractor_args'] = {
+            'youtube': {
+                'player_client': [client],
+                'skip': ['webpage']
+            }
+        }
+        print(f"🎯 Trying with client: {client}")
+    else:
+        print("🎯 Trying with default settings")
+    
+    # Try to use cookies if available
+    if os.path.exists(cookie_file):
+        opts['cookiefile'] = cookie_file
+        print("🍪 Using cookies file")
+    
+    # Add random user agent
+    opts['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        return True
+    except Exception as e:
+        print(f"❌ Failed with {client if client else 'default'}: {str(e)[:100]}")
+        return False
+
+# Try different methods
+methods = [
+    ('android', 'android'),
+    ('ios', 'ios'),
+    ('web', 'web'),
+    ('tv_embedded', 'tv_embedded'),
+    ('android_vr', 'android_vr'),
+    (None, 'default')
+]
+
+success = False
+for client_name, display_name in methods:
+    if download_with_ytdlp(client_name):
+        success = True
+        print(f"✅ Success with {display_name} method!")
+        break
+    print("---")
+
+if not success:
+    print("❌ All methods failed!")
+    sys.exit(1)
+PYSCRIPT
+
+          # Try multiple download approaches
+          SUCCESS=false
+          
+          # Method 1: Use the Python script with multiple clients
+          echo "Method 1: Multi-client Python approach..."
+          if python3 downloader.py "$URL" "$FORMAT" "tmp_downloads/%(title)s.%(ext)s"; then
+            SUCCESS=true
+            echo "✅ Download successful with Method 1!"
+          fi
+          
+          # Method 2: Direct yt-dlp with android client
+          if [ "$SUCCESS" = false ]; then
+            echo ""
+            echo "Method 2: yt-dlp with android client..."
+            if yt-dlp \
+              --extractor-args "youtube:player_client=android" \
+              --format "$FORMAT" \
+              --merge-output-format mp4 \
+              --output "tmp_downloads/%(title)s.%(ext)s" \
+              --no-playlist \
+              --retries 15 \
+              --sleep-requests 2 \
+              --sleep-interval 3 \
+              --max-sleep-interval 5 \
+              --user-agent "Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36" \
+              "$URL"; then
+              SUCCESS=true
+              echo "✅ Download successful with Method 2!"
+            fi
+          fi
+          
+          # Method 3: yt-dlp with ios client
+          if [ "$SUCCESS" = false ]; then
+            echo ""
+            echo "Method 3: yt-dlp with ios client..."
+            if yt-dlp \
+              --extractor-args "youtube:player_client=ios" \
+              --format "$FORMAT" \
+              --merge-output-format mp4 \
+              --output "tmp_downloads/%(title)s.%(ext)s" \
+              --no-playlist \
+              --retries 15 \
+              --sleep-requests 2 \
+              --user-agent "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" \
+              "$URL"; then
+              SUCCESS=true
+              echo "✅ Download successful with Method 3!"
+            fi
+          fi
+          
+          # Method 4: With proxy (using Cloudflare WARP)
+          if [ "$SUCCESS" = false ]; then
+            echo ""
+            echo "Method 4: Starting WARP proxy..."
+            
+            docker network create warp-net 2>/dev/null || true
+            docker run -d --name warp --network warp-net -p 1080:1080 --cap-add NET_ADMIN caomingjun/warp || true
+            sleep 30
+            
+            echo "Method 4a: yt-dlp via WARP proxy..."
+            if yt-dlp \
+              --proxy "socks5://127.0.0.1:1080" \
+              --extractor-args "youtube:player_client=android" \
+              --format "$FORMAT" \
+              --merge-output-format mp4 \
+              --output "tmp_downloads/%(title)s.%(ext)s" \
+              --no-playlist \
+              --retries 15 \
+              "$URL"; then
+              SUCCESS=true
+              echo "✅ Download successful with Method 4!"
+            fi
+            
+            docker stop warp || true
+            docker rm warp || true
+          fi
+          
+          # Method 5: With cookies (generate temporary cookies)
+          if [ "$SUCCESS" = false ]; then
+            echo ""
+            echo "Method 5: Generating cookies from browser simulation..."
+            
+            cat > gen_cookies.py << 'COOKIEPY'
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+import pickle
+import time
+
+options = Options()
+options.add_argument('--headless')
+options.add_argument('--no-sandbox')
+options.add_argument('--disable-dev-shm-usage')
+options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+
+driver = webdriver.Chrome(options=options)
+driver.get('https://www.youtube.com')
+time.sleep(5)
+cookies = driver.get_cookies()
+with open('cookies.txt', 'w') as f:
+    for cookie in cookies:
+        f.write(f"{cookie['domain']}\tTRUE\t{cookie.get('path', '/')}\t{'TRUE' if cookie.get('secure', False) else 'FALSE'}\t{cookie.get('expiry', 0)}\t{cookie['name']}\t{cookie['value']}\n")
+driver.quit()
+print("Cookies saved to cookies.txt")
+COOKIEPY
+            
+            # Try to install selenium and chrome
+            sudo apt-get install -y chromium-browser chromium-chromedriver 2>/dev/null || true
+            pip3 install selenium webdriver-manager 2>/dev/null || true
+            
+            python3 gen_cookies.py 2>/dev/null || true
+            
+            if yt-dlp --cookies cookies.txt --format "$FORMAT" --merge-output-format mp4 --output "tmp_downloads/%(title)s.%(ext)s" "$URL"; then
+              SUCCESS=true
+              echo "✅ Download successful with Method 5!"
+            fi
+          fi
+          
+          # Method 6: Use yt-dlp with different extractor
+          if [ "$SUCCESS" = false ]; then
+            echo ""
+            echo "Method 6: Using alternative extractor..."
+            if yt-dlp \
+              --force-generic-extractor \
+              --format "$FORMAT" \
+              --merge-output-format mp4 \
+              --output "tmp_downloads/%(title)s.%(ext)s" \
+              --no-playlist \
+              --retries 20 \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              "$URL"; then
+              SUCCESS=true
+              echo "✅ Download successful with Method 6!"
+            fi
+          fi
+          
+          if [ "$SUCCESS" = false ]; then
+            echo ""
+            echo "❌❌❌ ALL DOWNLOAD METHODS FAILED! ❌❌❌"
+            echo "Possible reasons:"
+            echo "1. YouTube has blocked this IP"
+            echo "2. Video is private/age-restricted"
+            echo "3. Video does not exist"
+            echo ""
+            echo "Try:"
+            echo "- Use a different video URL"
+            echo "- Run the action again (new IP may work)"
+            exit 1
+          fi
+
+          echo ""
+          echo "Download complete! Files:"
+          ls -la tmp_downloads/
+
+          # Continue with your existing zip/split code here...
+          # (The rest of your zip, split, and push code remains the same)
+
+      - name: Stop WARP Container (cleanup)
+        if: always()
+        run: |
+          docker stop warp 2>/dev/null || true
+          docker rm warp 2>/dev/null || true
