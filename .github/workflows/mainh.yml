@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       quality:
-        description: 'Video quality (best, 1080, 720, 480, audio)'
+        description: 'Video quality (1080, 720, 480, audio)'
         required: false
         default: '1080'
         type: string
@@ -43,144 +43,63 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y python3-pip ffmpeg zip curl jq bc
           pip3 install --upgrade yt-dlp
-          # Install cookies extractor
-          pip3 install browser-cookie3
 
-      - name: Download YouTube Video (Fixed)
+      - name: Download YouTube Video
         run: |
           URL="${{ github.event.inputs.youtube_url }}"
           QUALITY="${{ github.event.inputs.quality }}"
           ZIP_PASSWORD="${{ github.event.inputs.password }}"
 
           SPLIT_MB=90
+          BACKUP_DIR="/tmp/video_backup_$$"
+          mkdir -p "$BACKUP_DIR"
+          echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
           mkdir -p videos tmp_downloads
 
           echo "========================================="
-          echo "YouTube Downloader with Cookie Bypass"
+          echo "YouTube Downloader"
           echo "========================================="
           echo "URL: $URL"
           echo "Quality: $QUALITY"
-          echo ""
 
           # Set format based on quality
           case "$QUALITY" in
             "audio")
               FORMAT="bestaudio/best"
-              EXT="mp3"
               ;;
             "1080")
               FORMAT="bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best"
-              EXT="mp4"
               ;;
             "720")
               FORMAT="bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best"
-              EXT="mp4"
               ;;
             "480")
               FORMAT="bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best"
-              EXT="mp4"
               ;;
             *)
-              FORMAT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-              EXT="mp4"
+              FORMAT="bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best"
               ;;
           esac
 
-          # Create a Python script with multiple bypass methods
-          cat > downloader.py << 'PYSCRIPT'
-import yt_dlp
-import os
-import sys
+          # Download with multiple fallback methods
+          DOWNLOAD_SUCCESS=false
 
-url = sys.argv[1]
-format_spec = sys.argv[2]
-output_template = sys.argv[3]
-
-# Multiple player clients to try
-clients = ['android', 'ios', 'web', 'tv_embedded', 'tv', 'web_embedded']
-
-# Cookie file path
-cookie_file = 'cookies.txt'
-
-def download_with_ytdlp(client=None):
-    opts = {
-        'format': format_spec,
-        'merge_output_format': 'mp4',
-        'outtmpl': output_template,
-        'noplaylist': True,
-        'retries': 10,
-        'fragment_retries': 10,
-        'quiet': False,
-        'no_warnings': False,
-        'extract_flat': False,
-        'force_generic_extractor': False,
-    }
-    
-    # Add client if specified
-    if client:
-        opts['extractor_args'] = {
-            'youtube': {
-                'player_client': [client],
-                'skip': ['webpage']
-            }
-        }
-        print(f"🎯 Trying with client: {client}")
-    else:
-        print("🎯 Trying with default settings")
-    
-    # Try to use cookies if available
-    if os.path.exists(cookie_file):
-        opts['cookiefile'] = cookie_file
-        print("🍪 Using cookies file")
-    
-    # Add random user agent
-    opts['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-        return True
-    except Exception as e:
-        print(f"❌ Failed with {client if client else 'default'}: {str(e)[:100]}")
-        return False
-
-# Try different methods
-methods = [
-    ('android', 'android'),
-    ('ios', 'ios'),
-    ('web', 'web'),
-    ('tv_embedded', 'tv_embedded'),
-    ('android_vr', 'android_vr'),
-    (None, 'default')
-]
-
-success = False
-for client_name, display_name in methods:
-    if download_with_ytdlp(client_name):
-        success = True
-        print(f"✅ Success with {display_name} method!")
-        break
-    print("---")
-
-if not success:
-    print("❌ All methods failed!")
-    sys.exit(1)
-PYSCRIPT
-
-          # Try multiple download approaches
-          SUCCESS=false
-          
-          # Method 1: Use the Python script with multiple clients
-          echo "Method 1: Multi-client Python approach..."
-          if python3 downloader.py "$URL" "$FORMAT" "tmp_downloads/%(title)s.%(ext)s"; then
-            SUCCESS=true
-            echo "✅ Download successful with Method 1!"
+          # Method 1: Direct download
+          echo "Method 1: Direct download..."
+          if yt-dlp \
+            --format "$FORMAT" \
+            --merge-output-format mp4 \
+            --output "tmp_downloads/%(title)s.%(ext)s" \
+            --no-playlist \
+            --retries 10 \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            "$URL"; then
+            DOWNLOAD_SUCCESS=true
           fi
-          
-          # Method 2: Direct yt-dlp with android client
-          if [ "$SUCCESS" = false ]; then
-            echo ""
-            echo "Method 2: yt-dlp with android client..."
+
+          # Method 2: With android client
+          if [ "$DOWNLOAD_SUCCESS" = false ]; then
+            echo "Method 2: Android client..."
             if yt-dlp \
               --extractor-args "youtube:player_client=android" \
               --format "$FORMAT" \
@@ -188,20 +107,14 @@ PYSCRIPT
               --output "tmp_downloads/%(title)s.%(ext)s" \
               --no-playlist \
               --retries 15 \
-              --sleep-requests 2 \
-              --sleep-interval 3 \
-              --max-sleep-interval 5 \
-              --user-agent "Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36" \
               "$URL"; then
-              SUCCESS=true
-              echo "✅ Download successful with Method 2!"
+              DOWNLOAD_SUCCESS=true
             fi
           fi
-          
-          # Method 3: yt-dlp with ios client
-          if [ "$SUCCESS" = false ]; then
-            echo ""
-            echo "Method 3: yt-dlp with ios client..."
+
+          # Method 3: With iOS client
+          if [ "$DOWNLOAD_SUCCESS" = false ]; then
+            echo "Method 3: iOS client..."
             if yt-dlp \
               --extractor-args "youtube:player_client=ios" \
               --format "$FORMAT" \
@@ -209,122 +122,185 @@ PYSCRIPT
               --output "tmp_downloads/%(title)s.%(ext)s" \
               --no-playlist \
               --retries 15 \
-              --sleep-requests 2 \
-              --user-agent "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" \
               "$URL"; then
-              SUCCESS=true
-              echo "✅ Download successful with Method 3!"
+              DOWNLOAD_SUCCESS=true
             fi
           fi
-          
-          # Method 4: With proxy (using Cloudflare WARP)
-          if [ "$SUCCESS" = false ]; then
-            echo ""
-            echo "Method 4: Starting WARP proxy..."
-            
-            docker network create warp-net 2>/dev/null || true
-            docker run -d --name warp --network warp-net -p 1080:1080 --cap-add NET_ADMIN caomingjun/warp || true
-            sleep 30
-            
-            echo "Method 4a: yt-dlp via WARP proxy..."
-            if yt-dlp \
-              --proxy "socks5://127.0.0.1:1080" \
-              --extractor-args "youtube:player_client=android" \
-              --format "$FORMAT" \
-              --merge-output-format mp4 \
-              --output "tmp_downloads/%(title)s.%(ext)s" \
-              --no-playlist \
-              --retries 15 \
-              "$URL"; then
-              SUCCESS=true
-              echo "✅ Download successful with Method 4!"
-            fi
-            
-            docker stop warp || true
-            docker rm warp || true
-          fi
-          
-          # Method 5: With cookies (generate temporary cookies)
-          if [ "$SUCCESS" = false ]; then
-            echo ""
-            echo "Method 5: Generating cookies from browser simulation..."
-            
-            cat > gen_cookies.py << 'COOKIEPY'
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-import pickle
-import time
 
-options = Options()
-options.add_argument('--headless')
-options.add_argument('--no-sandbox')
-options.add_argument('--disable-dev-shm-usage')
-options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-
-driver = webdriver.Chrome(options=options)
-driver.get('https://www.youtube.com')
-time.sleep(5)
-cookies = driver.get_cookies()
-with open('cookies.txt', 'w') as f:
-    for cookie in cookies:
-        f.write(f"{cookie['domain']}\tTRUE\t{cookie.get('path', '/')}\t{'TRUE' if cookie.get('secure', False) else 'FALSE'}\t{cookie.get('expiry', 0)}\t{cookie['name']}\t{cookie['value']}\n")
-driver.quit()
-print("Cookies saved to cookies.txt")
-COOKIEPY
-            
-            # Try to install selenium and chrome
-            sudo apt-get install -y chromium-browser chromium-chromedriver 2>/dev/null || true
-            pip3 install selenium webdriver-manager 2>/dev/null || true
-            
-            python3 gen_cookies.py 2>/dev/null || true
-            
-            if yt-dlp --cookies cookies.txt --format "$FORMAT" --merge-output-format mp4 --output "tmp_downloads/%(title)s.%(ext)s" "$URL"; then
-              SUCCESS=true
-              echo "✅ Download successful with Method 5!"
-            fi
-          fi
-          
-          # Method 6: Use yt-dlp with different extractor
-          if [ "$SUCCESS" = false ]; then
-            echo ""
-            echo "Method 6: Using alternative extractor..."
-            if yt-dlp \
-              --force-generic-extractor \
-              --format "$FORMAT" \
-              --merge-output-format mp4 \
-              --output "tmp_downloads/%(title)s.%(ext)s" \
-              --no-playlist \
-              --retries 20 \
-              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-              "$URL"; then
-              SUCCESS=true
-              echo "✅ Download successful with Method 6!"
-            fi
-          fi
-          
-          if [ "$SUCCESS" = false ]; then
-            echo ""
-            echo "❌❌❌ ALL DOWNLOAD METHODS FAILED! ❌❌❌"
-            echo "Possible reasons:"
-            echo "1. YouTube has blocked this IP"
-            echo "2. Video is private/age-restricted"
-            echo "3. Video does not exist"
-            echo ""
-            echo "Try:"
-            echo "- Use a different video URL"
-            echo "- Run the action again (new IP may work)"
+          if [ "$DOWNLOAD_SUCCESS" = false ]; then
+            echo "❌ All download methods failed!"
             exit 1
           fi
 
-          echo ""
-          echo "Download complete! Files:"
+          echo "✅ Download complete!"
           ls -la tmp_downloads/
 
-          # Continue with your existing zip/split code here...
-          # (The rest of your zip, split, and push code remains the same)
+          # ============================================
+          # ZIP, SPLIT AND PREPARE FILES
+          # ============================================
 
-      - name: Stop WARP Container (cleanup)
-        if: always()
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+
+          get_random_word() {
+            WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta" "kappa" "lambda" "sigma" "omega" "nova" "star" "moon")
+            echo "${WORDS[$RANDOM % ${#WORDS[@]}]}_$RANDOM"
+          }
+
+          get_unique_folder() {
+            local BASE_PATH="$1"
+            local NAME="$2"
+            if [ ! -d "$BASE_PATH/$NAME" ] && [ ! -d "$BACKUP_DIR/$NAME" ]; then
+              echo "$NAME"
+              return
+            fi
+            local RANDOM_SUFFIX=$(get_random_word)
+            while [ -d "$BASE_PATH/${NAME}_${RANDOM_SUFFIX}" ] || [ -d "$BACKUP_DIR/${NAME}_${RANDOM_SUFFIX}" ]; do
+              RANDOM_SUFFIX=$(get_random_word)
+            done
+            echo "${NAME}_${RANDOM_SUFFIX}"
+          }
+
+          > /tmp/video_info.txt
+          FILE_INDEX=0
+
+          for FILE in tmp_downloads/*; do
+            [ -f "$FILE" ] || continue
+            SIZE=$(stat -c%s "$FILE")
+            BASENAME=$(basename "$FILE")
+            FILENAME_NO_EXT="${BASENAME%.*}"
+            EXT="${BASENAME##*.}"
+            FILE_INDEX=$((FILE_INDEX + 1))
+
+            echo "Processing: $BASENAME ($(( SIZE / 1024 / 1024 ))MB)"
+
+            FINAL_FOLDER_NAME=$(get_unique_folder "videos" "$FILENAME_NO_EXT" "true")
+            mkdir -p "$BACKUP_DIR/${FINAL_FOLDER_NAME}"
+
+            echo "${FILENAME_NO_EXT}|${FINAL_FOLDER_NAME}" >> /tmp/video_info.txt
+
+            TEMP_NAME="video_${FILE_INDEX}"
+            FOLDER_ENCODED=$(urlencode "${FINAL_FOLDER_NAME}")
+
+            if [ "$SIZE" -gt $(( SPLIT_MB * 1024 * 1024 )) ]; then
+              echo "  Splitting into ${SPLIT_MB}MB parts..."
+              cp "$FILE" "tmp_downloads/${TEMP_NAME}.${EXT}"
+              cd tmp_downloads
+              if [ -n "$ZIP_PASSWORD" ]; then
+                zip -0 -s "${SPLIT_MB}m" -P "$ZIP_PASSWORD" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+              else
+                zip -0 -s "${SPLIT_MB}m" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+              fi
+              for part in ${TEMP_NAME}.z[0-9]* ${TEMP_NAME}.zip; do
+                if [ -f "$part" ]; then
+                  PART_EXT="${part##*.}"
+                  mv "$part" "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.${PART_EXT}"
+                fi
+              done
+              rm -f "${TEMP_NAME}.${EXT}"
+              cd ..
+              PART_COUNT=$(ls "$BACKUP_DIR/${FINAL_FOLDER_NAME}/"*.z* 2>/dev/null | wc -l)
+            else
+              if [ -n "$ZIP_PASSWORD" ]; then
+                echo "  Creating password-protected zip..."
+                cd tmp_downloads
+                zip -j -P "$ZIP_PASSWORD" "${TEMP_NAME}.zip" "${BASENAME}"
+                mv "${TEMP_NAME}.zip" "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.zip"
+                cd ..
+              else
+                echo "  Copying file..."
+                cp "$FILE" "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.${EXT}"
+              fi
+            fi
+
+            # Create README.md
+            README_FILE="$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md"
+            {
+              echo "# ${FILENAME_NO_EXT}"
+              echo ""
+              echo "---"
+              echo "## Video Information"
+              echo "| Property | Value |"
+              echo "|----------|-------|"
+              echo "| **Video Name** | \`${FILENAME_NO_EXT}\` |"
+              echo "| **Original Link** | [YouTube Video](${URL}) |"
+              echo "| **Quality** | **${QUALITY}** |"
+              if [ -n "$ZIP_PASSWORD" ]; then
+                echo "| **Password Protected** | **YES** |"
+              else
+                echo "| **Password Protected** | **NO** |"
+              fi
+              echo ""
+              echo "---"
+              echo "*Powered by HASSANAHANI.ir*"
+            } > "$README_FILE"
+          done
+
+          rm -rf tmp_downloads
+
+      - name: Incremental Commit & Push
         run: |
-          docker stop warp 2>/dev/null || true
-          docker rm warp 2>/dev/null || true
+          BRANCH="${GITHUB_REF_NAME}"
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
+
+          echo "Starting incremental push..."
+
+          # Sync with remote
+          git fetch origin "$BRANCH"
+          git reset --hard origin/"$BRANCH"
+
+          # Copy backup files
+          mkdir -p videos
+          cp -r "$BACKUP_DIR"/* videos/
+
+          # Function to regenerate master README
+          regenerate_master_readme() {
+            MASTER_README="videos/README.md"
+            {
+              echo "# 📥 Downloaded Videos"
+              echo ""
+              echo "---"
+            } > "$MASTER_README"
+            
+            NUM=0
+            for folder in videos/*/; do
+              [ -d "$folder" ] || continue
+              [ -f "$folder/README.md" ] || continue
+              NUM=$((NUM + 1))
+              FOLDER_NAME=$(basename "$folder")
+              FOLDER_ENCODED=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$FOLDER_NAME'))")
+              echo "$NUM. 🎬 [${FOLDER_NAME}](https://github.com/${REPO_OWNER}/${REPO_NAME}/tree/${BRANCH}/videos/${FOLDER_ENCODED})" >> "$MASTER_README"
+            done
+          }
+
+          # Push files in batches
+          git add videos/
+          regenerate_master_readme
+          git add videos/README.md
+
+          if ! git diff --cached --quiet; then
+            git commit -m "[HASSANAHANI] YouTube download [skip ci]"
+            
+            # Push with retries
+            for i in {1..10}; do
+              if git push origin HEAD:"$BRANCH"; then
+                echo "✅ Push successful!"
+                break
+              fi
+              echo "Push failed, retry $i/10..."
+              git fetch origin "$BRANCH"
+              git reset --hard origin/"$BRANCH"
+              mkdir -p videos
+              cp -r "$BACKUP_DIR"/* videos/
+              git add videos/
+              regenerate_master_readme
+              git add videos/README.md
+              git commit -m "[HASSANAHANI] YouTube download [skip ci]" || true
+              sleep 5
+            done
+          fi
+
+          echo "✅ All done!"
