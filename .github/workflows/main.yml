@@ -10,7 +10,7 @@ on:
       quality:
         description: 'Video quality (best, 1080, 720, 480, audio)'
         required: false
-        default: '1080'
+        default: 'best'
         type: string
       password:
         description: 'Password for zip files (optional)'
@@ -34,297 +34,846 @@ jobs:
 
       - name: Configure Git for Large Files
         run: |
+          # Configure git for better large file handling
           git config --global http.postBuffer 524288000
-          git config --global user.name "github-actions"
-          git config --global user.email "github-actions@github.com"
+          git config --global http.maxRequestBuffer 100M
+          git config --global core.compression 0
+          git config --global pack.windowMemory 256m
+          git config --global pack.packSizeLimit 100m
+          git config --global pack.threads 1
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          echo "Git configured for large file handling"
+
+      - name: Start WARP Container
+        run: |
+          echo "Starting Cloudflare WARP container..."
+
+          docker network create warp-net || true
+
+          docker run -d \
+            --name warp \
+            --restart=always \
+            --network warp-net \
+            -p 1080:1080 \
+            --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+
+          echo "Waiting for WARP to initialize (30 seconds)..."
+          sleep 30
+
+          echo "Checking WARP status..."
+          for i in {1..10}; do
+            RESULT=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
+              echo "WARP is active!"
+              echo "$RESULT"
+              break
+            else
+              echo "Attempt $i/10 - WARP not ready yet, waiting..."
+              sleep 10
+            fi
+          done
+
+          FINAL=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+          if echo "$FINAL" | grep -qE "warp=(on|plus)"; then
+            echo "WARP proxy is ready!"
+          else
+            echo "WARP might not be fully active, but continuing anyway..."
+            echo "Response: $FINAL"
+          fi
 
       - name: Install Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-pip ffmpeg zip curl jq bc
           pip3 install --upgrade yt-dlp
-          # Install cookies extractor
-          pip3 install browser-cookie3
 
-      - name: Download YouTube Video (Fixed)
+      - name: Download YouTube Video
         run: |
           URL="${{ github.event.inputs.youtube_url }}"
           QUALITY="${{ github.event.inputs.quality }}"
           ZIP_PASSWORD="${{ github.event.inputs.password }}"
 
+          # REDUCED from 90MB to 45MB - under GitHub's 50MB recommendation
           SPLIT_MB=90
+          SPLIT_BYTES=$(( SPLIT_MB * 1024 * 1024 ))
+
+          # Create safe backup location for our files
+          BACKUP_DIR="/tmp/video_backup_$$"
+          mkdir -p "$BACKUP_DIR"
+          echo "$BACKUP_DIR" > /tmp/backup_dir_path.txt
+
           mkdir -p videos tmp_downloads
 
-          echo "========================================="
-          echo "YouTube Downloader with Cookie Bypass"
-          echo "========================================="
-          echo "URL: $URL"
-          echo "Quality: $QUALITY"
+          echo "HASSANAHANI YouTube Downloader"
+          echo "https://hasanahani.ir"
           echo ""
+          echo "Downloading: $URL"
+          echo "Quality: $QUALITY"
+          echo "Backup dir: $BACKUP_DIR"
+          echo "Split size: ${SPLIT_MB}MB (optimized for GitHub)"
+          if [ -n "$ZIP_PASSWORD" ]; then
+            echo "Password protection: ENABLED"
+          else
+            echo "Password protection: DISABLED"
+          fi
 
-          # Set format based on quality
+          # Function for proper URL encoding
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+
           case "$QUALITY" in
             "audio")
-              FORMAT="bestaudio/best"
-              EXT="mp3"
+              FORMAT="bestaudio"
+              ;;
+            "best")
+              FORMAT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
               ;;
             "1080")
               FORMAT="bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best"
-              EXT="mp4"
               ;;
             "720")
               FORMAT="bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best"
-              EXT="mp4"
               ;;
             "480")
               FORMAT="bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best"
-              EXT="mp4"
               ;;
             *)
               FORMAT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-              EXT="mp4"
               ;;
           esac
 
-          # Create a Python script with multiple bypass methods
-          cat > downloader.py << 'PYSCRIPT'
-import yt_dlp
-import os
-import sys
+          # Array of different methods to try
+          download_video() {
+            local METHOD=$1
+            echo "Trying download method $METHOD..."
 
-url = sys.argv[1]
-format_spec = sys.argv[2]
-output_template = sys.argv[3]
+            case $METHOD in
+              1)
+                yt-dlp \
+                  --proxy "socks5://127.0.0.1:1080" \
+                  --format "$FORMAT" \
+                  --merge-output-format mp4 \
+                  --output "tmp_downloads/%(title)s.%(ext)s" \
+                  --no-playlist \
+                  --retries 10 \
+                  --fragment-retries 10 \
+                  --concurrent-fragments 4 \
+                  --no-check-certificates \
+                  --prefer-free-formats \
+                  --no-warnings \
+                  "$URL"
+                ;;
+              2)
+                yt-dlp \
+                  --proxy "socks5://127.0.0.1:1080" \
+                  --format "$FORMAT" \
+                  --merge-output-format mp4 \
+                  --output "tmp_downloads/%(title)s.%(ext)s" \
+                  --no-playlist \
+                  --retries 10 \
+                  --fragment-retries 10 \
+                  --user-agent "Mozilla/5.0 (Linux; Android 12; SM-S906N Build/QP1A.190711.020) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36" \
+                  --extractor-args "youtube:player_client=android" \
+                  "$URL"
+                ;;
+              3)
+                yt-dlp \
+                  --proxy "socks5://127.0.0.1:1080" \
+                  --format "$FORMAT" \
+                  --merge-output-format mp4 \
+                  --output "tmp_downloads/%(title)s.%(ext)s" \
+                  --no-playlist \
+                  --retries 10 \
+                  --fragment-retries 10 \
+                  --user-agent "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1" \
+                  --extractor-args "youtube:player_client=ios" \
+                  "$URL"
+                ;;
+              4)
+                yt-dlp \
+                  --proxy "socks5://127.0.0.1:1080" \
+                  --format "$FORMAT" \
+                  --merge-output-format mp4 \
+                  --output "tmp_downloads/%(title)s.%(ext)s" \
+                  --no-playlist \
+                  --retries 10 \
+                  --fragment-retries 10 \
+                  --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                  --extractor-args "youtube:player_client=web" \
+                  --add-header "Accept-Language:en-US,en;q=0.9" \
+                  "$URL"
+                ;;
+              5)
+                yt-dlp \
+                  --format "$FORMAT" \
+                  --merge-output-format mp4 \
+                  --output "tmp_downloads/%(title)s.%(ext)s" \
+                  --no-playlist \
+                  --retries 10 \
+                  --fragment-retries 10 \
+                  --concurrent-fragments 4 \
+                  --no-check-certificates \
+                  --user-agent "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+                  "$URL"
+                ;;
+              6)
+                yt-dlp \
+                  --proxy "socks5://127.0.0.1:1080" \
+                  --format "$FORMAT" \
+                  --merge-output-format mp4 \
+                  --output "tmp_downloads/%(title)s.%(ext)s" \
+                  --no-playlist \
+                  --retries 10 \
+                  --fragment-retries 10 \
+                  --extractor-args "youtube:player_client=tv_embedded" \
+                  "$URL"
+                ;;
+            esac
+          }
 
-# Multiple player clients to try
-clients = ['android', 'ios', 'web', 'tv_embedded', 'tv', 'web_embedded']
-
-# Cookie file path
-cookie_file = 'cookies.txt'
-
-def download_with_ytdlp(client=None):
-    opts = {
-        'format': format_spec,
-        'merge_output_format': 'mp4',
-        'outtmpl': output_template,
-        'noplaylist': True,
-        'retries': 10,
-        'fragment_retries': 10,
-        'quiet': False,
-        'no_warnings': False,
-        'extract_flat': False,
-        'force_generic_extractor': False,
-    }
-    
-    # Add client if specified
-    if client:
-        opts['extractor_args'] = {
-            'youtube': {
-                'player_client': [client],
-                'skip': ['webpage']
-            }
-        }
-        print(f"🎯 Trying with client: {client}")
-    else:
-        print("🎯 Trying with default settings")
-    
-    # Try to use cookies if available
-    if os.path.exists(cookie_file):
-        opts['cookiefile'] = cookie_file
-        print("🍪 Using cookies file")
-    
-    # Add random user agent
-    opts['user_agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-        return True
-    except Exception as e:
-        print(f"❌ Failed with {client if client else 'default'}: {str(e)[:100]}")
-        return False
-
-# Try different methods
-methods = [
-    ('android', 'android'),
-    ('ios', 'ios'),
-    ('web', 'web'),
-    ('tv_embedded', 'tv_embedded'),
-    ('android_vr', 'android_vr'),
-    (None, 'default')
-]
-
-success = False
-for client_name, display_name in methods:
-    if download_with_ytdlp(client_name):
-        success = True
-        print(f"✅ Success with {display_name} method!")
-        break
-    print("---")
-
-if not success:
-    print("❌ All methods failed!")
-    sys.exit(1)
-PYSCRIPT
-
-          # Try multiple download approaches
-          SUCCESS=false
-          
-          # Method 1: Use the Python script with multiple clients
-          echo "Method 1: Multi-client Python approach..."
-          if python3 downloader.py "$URL" "$FORMAT" "tmp_downloads/%(title)s.%(ext)s"; then
-            SUCCESS=true
-            echo "✅ Download successful with Method 1!"
-          fi
-          
-          # Method 2: Direct yt-dlp with android client
-          if [ "$SUCCESS" = false ]; then
-            echo ""
-            echo "Method 2: yt-dlp with android client..."
-            if yt-dlp \
-              --extractor-args "youtube:player_client=android" \
-              --format "$FORMAT" \
-              --merge-output-format mp4 \
-              --output "tmp_downloads/%(title)s.%(ext)s" \
-              --no-playlist \
-              --retries 15 \
-              --sleep-requests 2 \
-              --sleep-interval 3 \
-              --max-sleep-interval 5 \
-              --user-agent "Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36" \
-              "$URL"; then
-              SUCCESS=true
-              echo "✅ Download successful with Method 2!"
+          DOWNLOAD_SUCCESS=false
+          for METHOD in 1 2 3 4 5 6; do
+            if download_video $METHOD; then
+              DOWNLOAD_SUCCESS=true
+              echo "Download successful with method $METHOD!"
+              break
+            else
+              echo "Method $METHOD failed, waiting before next attempt..."
+              sleep $((RANDOM % 10 + 5))
             fi
-          fi
-          
-          # Method 3: yt-dlp with ios client
-          if [ "$SUCCESS" = false ]; then
-            echo ""
-            echo "Method 3: yt-dlp with ios client..."
-            if yt-dlp \
-              --extractor-args "youtube:player_client=ios" \
-              --format "$FORMAT" \
-              --merge-output-format mp4 \
-              --output "tmp_downloads/%(title)s.%(ext)s" \
-              --no-playlist \
-              --retries 15 \
-              --sleep-requests 2 \
-              --user-agent "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" \
-              "$URL"; then
-              SUCCESS=true
-              echo "✅ Download successful with Method 3!"
-            fi
-          fi
-          
-          # Method 4: With proxy (using Cloudflare WARP)
-          if [ "$SUCCESS" = false ]; then
-            echo ""
-            echo "Method 4: Starting WARP proxy..."
-            
-            docker network create warp-net 2>/dev/null || true
-            docker run -d --name warp --network warp-net -p 1080:1080 --cap-add NET_ADMIN caomingjun/warp || true
-            sleep 30
-            
-            echo "Method 4a: yt-dlp via WARP proxy..."
-            if yt-dlp \
-              --proxy "socks5://127.0.0.1:1080" \
-              --extractor-args "youtube:player_client=android" \
-              --format "$FORMAT" \
-              --merge-output-format mp4 \
-              --output "tmp_downloads/%(title)s.%(ext)s" \
-              --no-playlist \
-              --retries 15 \
-              "$URL"; then
-              SUCCESS=true
-              echo "✅ Download successful with Method 4!"
-            fi
-            
-            docker stop warp || true
-            docker rm warp || true
-          fi
-          
-          # Method 5: With cookies (generate temporary cookies)
-          if [ "$SUCCESS" = false ]; then
-            echo ""
-            echo "Method 5: Generating cookies from browser simulation..."
-            
-            cat > gen_cookies.py << 'COOKIEPY'
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-import pickle
-import time
+          done
 
-options = Options()
-options.add_argument('--headless')
-options.add_argument('--no-sandbox')
-options.add_argument('--disable-dev-shm-usage')
-options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-
-driver = webdriver.Chrome(options=options)
-driver.get('https://www.youtube.com')
-time.sleep(5)
-cookies = driver.get_cookies()
-with open('cookies.txt', 'w') as f:
-    for cookie in cookies:
-        f.write(f"{cookie['domain']}\tTRUE\t{cookie.get('path', '/')}\t{'TRUE' if cookie.get('secure', False) else 'FALSE'}\t{cookie.get('expiry', 0)}\t{cookie['name']}\t{cookie['value']}\n")
-driver.quit()
-print("Cookies saved to cookies.txt")
-COOKIEPY
-            
-            # Try to install selenium and chrome
-            sudo apt-get install -y chromium-browser chromium-chromedriver 2>/dev/null || true
-            pip3 install selenium webdriver-manager 2>/dev/null || true
-            
-            python3 gen_cookies.py 2>/dev/null || true
-            
-            if yt-dlp --cookies cookies.txt --format "$FORMAT" --merge-output-format mp4 --output "tmp_downloads/%(title)s.%(ext)s" "$URL"; then
-              SUCCESS=true
-              echo "✅ Download successful with Method 5!"
-            fi
-          fi
-          
-          # Method 6: Use yt-dlp with different extractor
-          if [ "$SUCCESS" = false ]; then
-            echo ""
-            echo "Method 6: Using alternative extractor..."
-            if yt-dlp \
-              --force-generic-extractor \
-              --format "$FORMAT" \
-              --merge-output-format mp4 \
-              --output "tmp_downloads/%(title)s.%(ext)s" \
-              --no-playlist \
-              --retries 20 \
-              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-              "$URL"; then
-              SUCCESS=true
-              echo "✅ Download successful with Method 6!"
-            fi
-          fi
-          
-          if [ "$SUCCESS" = false ]; then
-            echo ""
-            echo "❌❌❌ ALL DOWNLOAD METHODS FAILED! ❌❌❌"
-            echo "Possible reasons:"
-            echo "1. YouTube has blocked this IP"
-            echo "2. Video is private/age-restricted"
-            echo "3. Video does not exist"
-            echo ""
-            echo "Try:"
-            echo "- Use a different video URL"
-            echo "- Run the action again (new IP may work)"
+          if [ "$DOWNLOAD_SUCCESS" = false ]; then
+            echo "All download methods failed!"
             exit 1
           fi
 
-          echo ""
-          echo "Download complete! Files:"
+          echo "Download complete!"
+          echo "Files in tmp_downloads:"
           ls -la tmp_downloads/
 
-          # Continue with your existing zip/split code here...
-          # (The rest of your zip, split, and push code remains the same)
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          BRANCH="${GITHUB_REF_NAME}"
 
-      - name: Stop WARP Container (cleanup)
+          RANDOM_WORDS=("alpha" "beta" "gamma" "delta" "epsilon" "zeta" "theta" "kappa" "lambda" "sigma" "omega" "nova" "star" "moon" "sun" "sky" "cloud" "river" "ocean" "mountain")
+
+          get_random_word() {
+            echo "${RANDOM_WORDS[$RANDOM % ${#RANDOM_WORDS[@]}]}_$RANDOM"
+          }
+
+          get_unique_folder() {
+            local BASE_PATH="$1"
+            local NAME="$2"
+            local CHECK_BACKUP="$3"
+
+            # Check both in videos and backup dir
+            if [ ! -d "$BASE_PATH/$NAME" ] && [ ! -d "$BACKUP_DIR/$NAME" ]; then
+              echo "$NAME"
+              return
+            fi
+            local RANDOM_SUFFIX=$(get_random_word)
+            while [ -d "$BASE_PATH/${NAME}_${RANDOM_SUFFIX}" ] || [ -d "$BACKUP_DIR/${NAME}_${RANDOM_SUFFIX}" ]; do
+              RANDOM_SUFFIX=$(get_random_word)
+            done
+            echo "${NAME}_${RANDOM_SUFFIX}"
+          }
+
+          # Create file to store video info
+          > /tmp/video_info.txt
+
+          FILE_INDEX=0
+          for FILE in tmp_downloads/*; do
+            [ -f "$FILE" ] || continue
+            SIZE=$(stat -c%s "$FILE")
+            BASENAME=$(basename "$FILE")
+            FILENAME_NO_EXT="${BASENAME%.*}"
+            EXT="${BASENAME##*.}"
+            FILE_INDEX=$((FILE_INDEX + 1))
+
+            echo "Processing: $BASENAME ($(( SIZE / 1024 / 1024 ))MB)"
+
+            FINAL_FOLDER_NAME=$(get_unique_folder "videos" "$FILENAME_NO_EXT" "true")
+
+            # Create folder in BACKUP location (safe from git operations)
+            mkdir -p "$BACKUP_DIR/${FINAL_FOLDER_NAME}"
+            echo "Created backup folder: $BACKUP_DIR/${FINAL_FOLDER_NAME}"
+
+            # Save info for master README update
+            echo "${FILENAME_NO_EXT}|${FINAL_FOLDER_NAME}" >> /tmp/video_info.txt
+
+            TEMP_NAME="video_${FILE_INDEX}"
+            FOLDER_ENCODED=$(urlencode "${FINAL_FOLDER_NAME}")
+
+            if [ "$SIZE" -gt "$SPLIT_BYTES" ]; then
+              echo "Splitting $BASENAME into ${SPLIT_MB}MB parts..."
+
+              cp "$FILE" "tmp_downloads/${TEMP_NAME}.${EXT}"
+
+              cd tmp_downloads
+              if [ -n "$ZIP_PASSWORD" ]; then
+                zip -0 -s "${SPLIT_MB}m" -P "$ZIP_PASSWORD" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+              else
+                zip -0 -s "${SPLIT_MB}m" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+              fi
+
+              for part in ${TEMP_NAME}.z[0-9]* ${TEMP_NAME}.zip; do
+                if [ -f "$part" ]; then
+                  PART_EXT="${part##*.}"
+                  mv "$part" "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.${PART_EXT}"
+                  echo "  Created: ${FINAL_FOLDER_NAME}.${PART_EXT}"
+                fi
+              done
+
+              rm -f "${TEMP_NAME}.${EXT}"
+              cd ..
+
+              PART_COUNT=$(ls "$BACKUP_DIR/${FINAL_FOLDER_NAME}/"*.z* 2>/dev/null | wc -l)
+              echo "Created $PART_COUNT parts"
+
+              TOTAL_SIZE=0
+              for part_file in "$BACKUP_DIR/${FINAL_FOLDER_NAME}"/*; do
+                if [ -f "$part_file" ]; then
+                  PART_SIZE=$(stat -c%s "$part_file")
+                  TOTAL_SIZE=$((TOTAL_SIZE + PART_SIZE))
+                fi
+              done
+              TOTAL_SIZE_MB=$(echo "scale=2; $TOTAL_SIZE / 1024 / 1024" | bc)
+
+              DOWNLOAD_LINKS_MD=""
+              LINK_NUM=0
+              for part_file in "$BACKUP_DIR/${FINAL_FOLDER_NAME}"/*.z*; do
+                if [ -f "$part_file" ]; then
+                  PART_BASENAME=$(basename "$part_file")
+                  PART_ENCODED=$(urlencode "${PART_BASENAME}")
+                  RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${FOLDER_ENCODED}/${PART_ENCODED}"
+                  LINK_NUM=$((LINK_NUM + 1))
+                  DOWNLOAD_LINKS_MD="${DOWNLOAD_LINKS_MD}| ${LINK_NUM} | \`${PART_BASENAME}\` | [Download](${RAW_LINK}) |"$'\n'
+                fi
+              done
+
+              README_FILE="$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md"
+              {
+                printf '%s\n' "# ${FILENAME_NO_EXT}"
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "## Video Information"
+                printf '%s\n' ""
+                printf '%s\n' "| Property | Value |"
+                printf '%s\n' "|----------|-------|"
+                printf '%s\n' "| **Video Name** | \`${FILENAME_NO_EXT}\` |"
+                printf '%s\n' "| **Original Link** | [YouTube Video](${URL}) |"
+                printf '%s\n' "| **Total Size** | **${PART_COUNT} zip parts** - **${TOTAL_SIZE_MB} MB** |"
+                printf '%s\n' "| **Quality** | **${QUALITY}** |"
+                printf '%s\n' "| **Status** | **Complete (100%)** |"
+                if [ -n "$ZIP_PASSWORD" ]; then
+                  printf '%s\n' "| **Password Protected** | **YES** |"
+                else
+                  printf '%s\n' "| **Password Protected** | **NO** |"
+                fi
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "## Download Links"
+                printf '%s\n' ""
+                printf '%s\n' "| # | File | Link |"
+                printf '%s\n' "|---|------|------|"
+                printf '%s' "${DOWNLOAD_LINKS_MD}"
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "## How to Extract"
+                printf '%s\n' ""
+                printf '%s\n' "1. **Download** all \`.zip\` and \`.z01\`, \`.z02\`... files"
+                printf '%s\n' "2. **Extract** using [7-Zip](https://www.7-zip.org/) or [WinRAR](https://www.rarlab.com/)"
+                printf '%s\n' "3. Open the \`.zip\` file - all parts will combine automatically"
+                printf '%s\n' ""
+                printf '%s\n' "---"
+                printf '%s\n' ""
+                printf '%s\n' "*This tool created by [HASSANAHANI.ir](https://hasanahani.ir)*"
+              } > "$README_FILE"
+
+              echo "Created README.md"
+
+            else
+              if [ -n "$ZIP_PASSWORD" ]; then
+                echo "$BASENAME - creating password-protected zip"
+
+                cp "$FILE" "tmp_downloads/${TEMP_NAME}.${EXT}"
+
+                cd tmp_downloads
+                zip -j -P "$ZIP_PASSWORD" "${TEMP_NAME}.zip" "${TEMP_NAME}.${EXT}"
+                mv "${TEMP_NAME}.zip" "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.zip"
+                rm -f "${TEMP_NAME}.${EXT}"
+                cd ..
+
+                SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
+                FILE_ENCODED=$(urlencode "${FINAL_FOLDER_NAME}.zip")
+                RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${FOLDER_ENCODED}/${FILE_ENCODED}"
+
+                README_FILE="$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md"
+                {
+                  printf '%s\n' "# ${FILENAME_NO_EXT}"
+                  printf '%s\n' ""
+                  printf '%s\n' "---"
+                  printf '%s\n' ""
+                  printf '%s\n' "## Video Information"
+                  printf '%s\n' ""
+                  printf '%s\n' "| Property | Value |"
+                  printf '%s\n' "|----------|-------|"
+                  printf '%s\n' "| **Video Name** | \`${FILENAME_NO_EXT}\` |"
+                  printf '%s\n' "| **Original Link** | [YouTube Video](${URL}) |"
+                  printf '%s\n' "| **Total Size** | **1 zip file** - **${SIZE_MB} MB** |"
+                  printf '%s\n' "| **Quality** | **${QUALITY}** |"
+                  printf '%s\n' "| **Status** | **Complete (100%)** |"
+                  printf '%s\n' "| **Password Protected** | **YES** |"
+                  printf '%s\n' ""
+                  printf '%s\n' "---"
+                  printf '%s\n' ""
+                  printf '%s\n' "## Download Link"
+                  printf '%s\n' ""
+                  printf '%s\n' "| # | File | Link |"
+                  printf '%s\n' "|---|------|------|"
+                  printf '%s\n' "| 1 | \`${FINAL_FOLDER_NAME}.zip\` | [Download](${RAW_LINK}) |"
+                  printf '%s\n' ""
+                  printf '%s\n' "---"
+                  printf '%s\n' ""
+                  printf '%s\n' "*This tool created by [HASSANAHANI.ir](https://hasanahani.ir)*"
+                } > "$README_FILE"
+
+                echo "Created password-protected zip and README.md"
+
+              else
+                echo "$BASENAME - copying mp4"
+
+                cp "$FILE" "$BACKUP_DIR/${FINAL_FOLDER_NAME}/${FINAL_FOLDER_NAME}.${EXT}"
+
+                SIZE_MB=$(echo "scale=2; $SIZE / 1024 / 1024" | bc)
+                FILE_ENCODED=$(urlencode "${FINAL_FOLDER_NAME}.${EXT}")
+                RAW_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/${BRANCH}/videos/${FOLDER_ENCODED}/${FILE_ENCODED}"
+
+                README_FILE="$BACKUP_DIR/${FINAL_FOLDER_NAME}/README.md"
+                {
+                  printf '%s\n' "# ${FILENAME_NO_EXT}"
+                  printf '%s\n' ""
+                  printf '%s\n' "---"
+                  printf '%s\n' ""
+                  printf '%s\n' "## Video Information"
+                  printf '%s\n' ""
+                  printf '%s\n' "| Property | Value |"
+                  printf '%s\n' "|----------|-------|"
+                  printf '%s\n' "| **Video Name** | \`${FILENAME_NO_EXT}\` |"
+                  printf '%s\n' "| **Original Link** | [YouTube Video](${URL}) |"
+                  printf '%s\n' "| **Total Size** | **1 file** (no split) - **${SIZE_MB} MB** |"
+                  printf '%s\n' "| **Quality** | **${QUALITY}** |"
+                  printf '%s\n' "| **Status** | **Complete (100%)** |"
+                  printf '%s\n' "| **Password Protected** | **NO** |"
+                  printf '%s\n' ""
+                  printf '%s\n' "---"
+                  printf '%s\n' ""
+                  printf '%s\n' "## Download Link"
+                  printf '%s\n' ""
+                  printf '%s\n' "| # | File | Link |"
+                  printf '%s\n' "|---|------|------|"
+                  printf '%s\n' "| 1 | \`${FINAL_FOLDER_NAME}.${EXT}\` | [Download](${RAW_LINK}) |"
+                  printf '%s\n' ""
+                  printf '%s\n' "---"
+                  printf '%s\n' ""
+                  printf '%s\n' "Ready to use - no extraction needed!"
+                  printf '%s\n' ""
+                  printf '%s\n' "---"
+                  printf '%s\n' ""
+                  printf '%s\n' "*This tool created by [HASSANAHANI.ir](https://hasanahani.ir)*"
+                } > "$README_FILE"
+
+                echo "Copied mp4 and created README.md"
+              fi
+            fi
+          done
+
+          rm -rf tmp_downloads
+
+          # Debug: Show backup contents
+          echo ""
+          echo "===== Backup folder contents ====="
+          find "$BACKUP_DIR" -type f | head -50
+          echo "===== Video info file ====="
+          cat /tmp/video_info.txt
+
+      - name: Stop WARP Container
         if: always()
         run: |
-          docker stop warp 2>/dev/null || true
-          docker rm warp 2>/dev/null || true
+          docker stop warp || true
+          docker rm warp || true
+
+      - name: Incremental Commit & Push
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+
+          echo "HASSANAHANI (https://hasanahani.ir) - Incremental Push Mode"
+          echo "This method pushes files ONE AT A TIME to avoid timeout issues"
+          echo ""
+
+          # Get backup directory path
+          BACKUP_DIR=$(cat /tmp/backup_dir_path.txt)
+          echo "Backup directory: $BACKUP_DIR"
+
+          # Check backup has files
+          BACKUP_FILE_COUNT=$(find "$BACKUP_DIR" -type f 2>/dev/null | wc -l)
+          echo "Total files to push: $BACKUP_FILE_COUNT"
+
+          if [ "$BACKUP_FILE_COUNT" -eq 0 ]; then
+            echo "ERROR: No files in backup directory!"
+            exit 1
+          fi
+
+          # Function for URL encoding
+          urlencode() {
+            python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
+          }
+
+          # Function to regenerate master README from all folders
+          regenerate_master_readme() {
+            MASTER_README="videos/README.md"
+
+            echo "Regenerating master README..."
+
+            # Start fresh README
+            {
+              echo "# DOWNLOADED VIDEOS LIST :"
+              echo ""
+              echo "----"
+              echo ""
+            } > "$MASTER_README"
+
+            # Video emojis
+            VIDEO_EMOJIS=("🎬" "🎥" "📽️" "🎞️" "📺" "🎦" "🎭" "🎪" "🎯" "🎮" "🎵" "🎶" "🎸" "🎹" "🎤")
+
+            # Counter for numbering
+            NUM=0
+
+            # Add all existing video folders
+            for folder in videos/*/; do
+              [ -d "$folder" ] || continue
+              FOLDER_NAME=$(basename "$folder")
+
+              # Skip if it's not a video folder (check for README.md inside)
+              [ -f "$folder/README.md" ] || continue
+
+              NUM=$((NUM + 1))
+              RANDOM_EMOJI="${VIDEO_EMOJIS[$RANDOM % ${#VIDEO_EMOJIS[@]}]}"
+              FOLDER_ENCODED=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$FOLDER_NAME")
+              FOLDER_LINK="https://github.com/${REPO_OWNER}/${REPO_NAME}/tree/${BRANCH}/videos/${FOLDER_ENCODED}"
+
+              printf -- "- %s - %s [%s](%s)\n" "$NUM" "$RANDOM_EMOJI" "$FOLDER_NAME" "$FOLDER_LINK" >> "$MASTER_README"
+            done
+
+            echo "Master README regenerated with $NUM videos"
+          }
+
+          # Function to push a single file with retries
+          push_single_file() {
+            local FILE_PATH="$1"
+            local MAX_RETRIES=5
+            local RETRY=0
+
+            while [ $RETRY -lt $MAX_RETRIES ]; do
+              RETRY=$((RETRY + 1))
+
+              # Fetch latest
+              git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+
+              # Check if we need to rebase
+              LOCAL_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "none")
+              REMOTE_HEAD=$(git rev-parse origin/"$BRANCH" 2>/dev/null || echo "none")
+
+              if [ "$LOCAL_HEAD" != "$REMOTE_HEAD" ] && [ "$REMOTE_HEAD" != "none" ]; then
+                echo "    Syncing with remote..."
+                git reset --hard origin/"$BRANCH" 2>/dev/null || true
+
+                # Re-copy all backup files to ensure they exist
+                mkdir -p videos
+                cp -r "$BACKUP_DIR"/* videos/ 2>/dev/null || true
+              fi
+
+              # Stage the specific file
+              git add "$FILE_PATH" 2>/dev/null || true
+
+              # Check if there's anything to commit
+              if git diff --cached --quiet 2>/dev/null; then
+                echo "    File already exists or no changes"
+                return 0
+              fi
+
+              # Commit
+              FILENAME=$(basename "$FILE_PATH")
+              git commit -m "[HASSANAHANI] Add: $FILENAME [skip ci]" --quiet 2>/dev/null || true
+
+              # Push with timeout
+              echo "    Push attempt $RETRY/$MAX_RETRIES..."
+              if timeout 120 git push origin HEAD:"$BRANCH" 2>&1; then
+                echo "    SUCCESS!"
+                return 0
+              else
+                echo "    Push failed, retrying..."
+                sleep $((2 + RANDOM % 5))
+              fi
+            done
+
+            echo "    WARNING: Failed to push $FILE_PATH after $MAX_RETRIES attempts"
+            return 1
+          }
+
+          # Function to push files in small batches
+          push_batch() {
+            local BATCH_SIZE=3  # Push 3 files at a time (about 135MB with 45MB splits)
+            local FILES=("$@")
+            local BATCH_COUNT=0
+            local BATCH_FILES=()
+            local TOTAL_PUSHED=0
+            local TOTAL_FILES=${#FILES[@]}
+
+            for FILE in "${FILES[@]}"; do
+              BATCH_FILES+=("$FILE")
+              BATCH_COUNT=$((BATCH_COUNT + 1))
+
+              if [ $BATCH_COUNT -ge $BATCH_SIZE ]; then
+                TOTAL_PUSHED=$((TOTAL_PUSHED + BATCH_COUNT))
+                echo ""
+                echo ">>> Pushing batch ($TOTAL_PUSHED/$TOTAL_FILES files)..."
+
+                # Fetch and reset to latest
+                git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+                git reset --hard origin/"$BRANCH" 2>/dev/null || true
+
+                # Re-copy all backup files
+                mkdir -p videos
+                cp -r "$BACKUP_DIR"/* videos/ 2>/dev/null || true
+
+                # Add batch files
+                for BF in "${BATCH_FILES[@]}"; do
+                  git add "$BF" 2>/dev/null || true
+                done
+
+                # Commit batch
+                if ! git diff --cached --quiet 2>/dev/null; then
+                  git commit -m "[HASSANAHANI] Add batch of $BATCH_COUNT files [skip ci]" --quiet 2>/dev/null || true
+
+                  # Push with retries
+                  local PUSH_RETRY=0
+                  local PUSH_SUCCESS=false
+                  while [ $PUSH_RETRY -lt 5 ]; do
+                    PUSH_RETRY=$((PUSH_RETRY + 1))
+                    if timeout 180 git push origin HEAD:"$BRANCH" 2>&1; then
+                      PUSH_SUCCESS=true
+                      echo "    Batch pushed successfully!"
+                      break
+                    else
+                      echo "    Batch push failed, attempt $PUSH_RETRY/5..."
+                      git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+                      git reset --hard origin/"$BRANCH" 2>/dev/null || true
+                      mkdir -p videos
+                      cp -r "$BACKUP_DIR"/* videos/ 2>/dev/null || true
+                      for BF in "${BATCH_FILES[@]}"; do
+                        git add "$BF" 2>/dev/null || true
+                      done
+                      if ! git diff --cached --quiet 2>/dev/null; then
+                        git commit -m "[HASSANAHANI] Add batch of $BATCH_COUNT files [skip ci]" --quiet 2>/dev/null || true
+                      fi
+                      sleep $((3 + RANDOM % 7))
+                    fi
+                  done
+
+                  if [ "$PUSH_SUCCESS" = false ]; then
+                    echo "    WARNING: Batch push failed, trying files individually..."
+                    for BF in "${BATCH_FILES[@]}"; do
+                      push_single_file "$BF"
+                    done
+                  fi
+                fi
+
+                BATCH_FILES=()
+                BATCH_COUNT=0
+                sleep 2
+              fi
+            done
+
+            # Push remaining files
+            if [ ${#BATCH_FILES[@]} -gt 0 ]; then
+              TOTAL_PUSHED=$((TOTAL_PUSHED + ${#BATCH_FILES[@]}))
+              echo ""
+              echo ">>> Pushing final batch ($TOTAL_PUSHED/$TOTAL_FILES files)..."
+
+              git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+              git reset --hard origin/"$BRANCH" 2>/dev/null || true
+              mkdir -p videos
+              cp -r "$BACKUP_DIR"/* videos/ 2>/dev/null || true
+
+              for BF in "${BATCH_FILES[@]}"; do
+                git add "$BF" 2>/dev/null || true
+              done
+
+              if ! git diff --cached --quiet 2>/dev/null; then
+                git commit -m "[HASSANAHANI] Add final batch [skip ci]" --quiet 2>/dev/null || true
+
+                local PUSH_RETRY=0
+                while [ $PUSH_RETRY -lt 5 ]; do
+                  PUSH_RETRY=$((PUSH_RETRY + 1))
+                  if timeout 180 git push origin HEAD:"$BRANCH" 2>&1; then
+                    echo "    Final batch pushed successfully!"
+                    break
+                  else
+                    echo "    Push failed, attempt $PUSH_RETRY/5..."
+                    sleep $((3 + RANDOM % 7))
+                    git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+                    git reset --hard origin/"$BRANCH" 2>/dev/null || true
+                    mkdir -p videos
+                    cp -r "$BACKUP_DIR"/* videos/ 2>/dev/null || true
+                    for BF in "${BATCH_FILES[@]}"; do
+                      git add "$BF" 2>/dev/null || true
+                    done
+                    if ! git diff --cached --quiet 2>/dev/null; then
+                      git commit -m "[HASSANAHANI] Add final batch [skip ci]" --quiet 2>/dev/null || true
+                    fi
+                  fi
+                done
+              fi
+            fi
+          }
+
+          # ============================================
+          # MAIN INCREMENTAL PUSH LOGIC
+          # ============================================
+
+          echo ""
+          echo "=========================================="
+          echo "Starting incremental push process..."
+          echo "=========================================="
+
+          # First, sync with remote
+          echo "Syncing with remote repository..."
+          git fetch origin "$BRANCH"
+          git reset --hard origin/"$BRANCH"
+
+          # Create videos directory and copy files
+          mkdir -p videos
+          cp -r "$BACKUP_DIR"/* videos/
+
+          # Generate list of files to push (sorted by size, smallest first)
+          echo "Analyzing files to push..."
+          ALL_FILES=()
+
+          # First add README files (small)
+          while IFS= read -r -d '' FILE; do
+            ALL_FILES+=("$FILE")
+          done < <(find videos -name "README.md" -print0 2>/dev/null)
+
+          # Then add zip parts sorted by name (for ordered upload)
+          while IFS= read -r -d '' FILE; do
+            ALL_FILES+=("$FILE")
+          done < <(find videos -type f \( -name "*.z[0-9]*" -o -name "*.zip" -o -name "*.mp4" -o -name "*.mp3" -o -name "*.m4a" \) -print0 2>/dev/null | sort -z)
+
+          TOTAL_FILES=${#ALL_FILES[@]}
+          echo "Found $TOTAL_FILES files to push"
+          echo ""
+
+          if [ $TOTAL_FILES -eq 0 ]; then
+            echo "No files to push!"
+            exit 0
+          fi
+
+          # Calculate total size
+          TOTAL_SIZE=0
+          for F in "${ALL_FILES[@]}"; do
+            if [ -f "$F" ]; then
+              FSIZE=$(stat -c%s "$F" 2>/dev/null || echo 0)
+              TOTAL_SIZE=$((TOTAL_SIZE + FSIZE))
+            fi
+          done
+          TOTAL_SIZE_MB=$((TOTAL_SIZE / 1024 / 1024))
+          echo "Total size: ${TOTAL_SIZE_MB}MB"
+          echo ""
+
+          # Decide push strategy based on total size
+          if [ $TOTAL_SIZE_MB -lt 100 ]; then
+            echo "Small upload - pushing all at once..."
+
+            git add -A videos/
+            regenerate_master_readme
+            git add videos/README.md
+
+            if ! git diff --cached --quiet; then
+              git commit -m "[HASSANAHANI] YouTube download [skip ci]"
+
+              PUSH_RETRY=0
+              while [ $PUSH_RETRY -lt 10 ]; do
+                PUSH_RETRY=$((PUSH_RETRY + 1))
+                if timeout 300 git push origin HEAD:"$BRANCH"; then
+                  echo "Push successful!"
+                  break
+                else
+                  echo "Push failed, retry $PUSH_RETRY/10..."
+                  sleep $((3 + RANDOM % 7))
+                  git fetch origin "$BRANCH"
+                  git reset --hard origin/"$BRANCH"
+                  mkdir -p videos
+                  cp -r "$BACKUP_DIR"/* videos/
+                  git add -A videos/
+                  regenerate_master_readme
+                  git add videos/README.md
+                  if ! git diff --cached --quiet; then
+                    git commit -m "[HASSANAHANI] YouTube download [skip ci]"
+                  fi
+                fi
+              done
+            fi
+
+          else
+            echo "Large upload (${TOTAL_SIZE_MB}MB) - using incremental batch push..."
+            echo ""
+
+            # Push files in batches
+            push_batch "${ALL_FILES[@]}"
+
+            # Final push for master README
+            echo ""
+            echo "Pushing master README..."
+            git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+            git reset --hard origin/"$BRANCH" 2>/dev/null || true
+            mkdir -p videos
+            cp -r "$BACKUP_DIR"/* videos/ 2>/dev/null || true
+
+            regenerate_master_readme
+            git add videos/README.md
+
+            if ! git diff --cached --quiet 2>/dev/null; then
+              git commit -m "[HASSANAHANI] Update video list [skip ci]" --quiet 2>/dev/null || true
+
+              PUSH_RETRY=0
+              while [ $PUSH_RETRY -lt 5 ]; do
+                PUSH_RETRY=$((PUSH_RETRY + 1))
+                if timeout 60 git push origin HEAD:"$BRANCH" 2>&1; then
+                  echo "Master README pushed!"
+                  break
+                else
+                  echo "README push failed, retry $PUSH_RETRY/5..."
+                  sleep 3
+                fi
+              done
+            fi
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "All files pushed successfully!"
+          echo "HASSANAHANI (https://hasanahani.ir)"
+          echo "=========================================="
