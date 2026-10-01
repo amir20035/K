@@ -1,0 +1,443 @@
+name: 📦 Download YouTube Videos in Batches
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: 'Number of videos per ZIP'
+        required: false
+        default: '320'
+        type: string
+
+      quality:
+        description: 'Video quality'
+        required: false
+        default: 'best'
+        type: choice
+        options:
+          - best
+          - 1080
+          - 720
+          - 480
+          - audio
+
+      start_batch:
+        description: 'Start from batch number'
+        required: false
+        default: '1'
+        type: string
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 360
+
+    permissions:
+      contents: write
+
+    steps:
+
+      # ==========================================
+      # CHECKOUT
+      # ==========================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ==========================================
+      # INSTALL
+      # ==========================================
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            ffmpeg \
+            zip \
+            unzip \
+            p7zip-full \
+            python3-pip \
+            git
+
+          python3 -m pip install --upgrade yt-dlp
+
+          yt-dlp --version
+          ffmpeg -version | head -n 1
+
+      # ==========================================
+      # CHECK LINKS
+      # ==========================================
+
+      - name: Check playlist links
+        run: |
+
+          if [ ! -f "output/playlist_links.txt" ]; then
+            echo "ERROR:"
+            echo "output/playlist_links.txt not found!"
+            exit 1
+          fi
+
+          TOTAL=$(grep -c '^https://' output/playlist_links.txt || true)
+
+          echo "Total links: $TOTAL"
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "No YouTube links found."
+            exit 1
+          fi
+
+      # ==========================================
+      # DOWNLOAD BATCH
+      # ==========================================
+
+      - name: Download videos
+        env:
+          BATCH_SIZE: ${{ inputs.batch_size }}
+          QUALITY: ${{ inputs.quality }}
+          START_BATCH: ${{ inputs.start_batch }}
+        run: |
+
+          set -e
+
+          mkdir -p downloads
+          mkdir -p archives
+
+          TOTAL_LINKS=$(grep -c '^https://' output/playlist_links.txt)
+
+          echo "======================================"
+          echo "YouTube Batch Downloader"
+          echo "======================================"
+          echo "Total links: $TOTAL_LINKS"
+          echo "Batch size: $BATCH_SIZE"
+          echo "Quality: $QUALITY"
+          echo "Start batch: $START_BATCH"
+          echo "======================================"
+
+          # --------------------------------------
+          # FORMAT
+          # --------------------------------------
+
+          case "$QUALITY" in
+
+            best)
+              FORMAT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+              ;;
+
+            1080)
+              FORMAT="bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best"
+              ;;
+
+            720)
+              FORMAT="bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best"
+              ;;
+
+            480)
+              FORMAT="bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best"
+              ;;
+
+            audio)
+              FORMAT="bestaudio/best"
+              ;;
+
+            *)
+              FORMAT="bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+              ;;
+
+          esac
+
+          # --------------------------------------
+          # CALCULATE BATCHES
+          # --------------------------------------
+
+          TOTAL_BATCHES=$(( (TOTAL_LINKS + BATCH_SIZE - 1) / BATCH_SIZE ))
+
+          echo "Total batches: $TOTAL_BATCHES"
+
+          # --------------------------------------
+          # PROCESS BATCHES
+          # --------------------------------------
+
+          for (( BATCH=$START_BATCH; BATCH<=TOTAL_BATCHES; BATCH++ ))
+          do
+
+            echo ""
+            echo "======================================"
+            echo "PROCESSING BATCH $BATCH / $TOTAL_BATCHES"
+            echo "======================================"
+
+            BATCH_FOLDER=$(printf "batch_%03d" "$BATCH")
+
+            rm -rf "downloads/$BATCH_FOLDER"
+            mkdir -p "downloads/$BATCH_FOLDER"
+
+            START=$(( (BATCH - 1) * BATCH_SIZE + 1 ))
+            END=$(( BATCH * BATCH_SIZE ))
+
+            if [ "$END" -gt "$TOTAL_LINKS" ]; then
+              END="$TOTAL_LINKS"
+            fi
+
+            echo "Videos:"
+            echo "$START → $END"
+
+            # ----------------------------------
+            # EXTRACT LINKS FOR THIS BATCH
+            # ----------------------------------
+
+            sed -n "${START},${END}p" \
+              output/playlist_links.txt \
+              > "/tmp/batch_${BATCH}.txt"
+
+            COUNT=$(wc -l < "/tmp/batch_${BATCH}.txt")
+
+            echo "Videos in batch: $COUNT"
+
+            # ----------------------------------
+            # DOWNLOAD
+            # ----------------------------------
+
+            VIDEO_NUMBER=0
+
+            while IFS= read -r URL
+            do
+
+              [ -z "$URL" ] && continue
+
+              VIDEO_NUMBER=$((VIDEO_NUMBER + 1))
+
+              echo ""
+              echo "--------------------------------------"
+              echo "Batch $BATCH"
+              echo "Video $VIDEO_NUMBER / $COUNT"
+              echo "$URL"
+              echo "--------------------------------------"
+
+              yt-dlp \
+                --format "$FORMAT" \
+                --merge-output-format mp4 \
+                --output "downloads/$BATCH_FOLDER/%(playlist_index)03d - %(title).180B.%(ext)s" \
+                --no-playlist \
+                --retries 10 \
+                --fragment-retries 10 \
+                --concurrent-fragments 4 \
+                --continue \
+                --no-overwrites \
+                "$URL" || {
+
+                  echo "WARNING: Failed:"
+                  echo "$URL"
+
+                  echo "$URL" >> \
+                    "downloads/$BATCH_FOLDER/FAILED.txt"
+              }
+
+            done < "/tmp/batch_${BATCH}.txt"
+
+            # ----------------------------------
+            # CHECK DOWNLOADS
+            # ----------------------------------
+
+            echo ""
+            echo "Downloaded files:"
+
+            find "downloads/$BATCH_FOLDER" \
+              -maxdepth 1 \
+              -type f \
+              -printf '%f\n'
+
+            VIDEO_COUNT=$(find \
+              "downloads/$BATCH_FOLDER" \
+              -maxdepth 1 \
+              -type f \
+              \( \
+                -name "*.mp4" \
+                -o -name "*.webm" \
+                -o -name "*.mkv" \
+                -o -name "*.mp3" \
+                -o -name "*.m4a" \
+              \) \
+              | wc -l)
+
+            echo ""
+            echo "Successfully downloaded: $VIDEO_COUNT / $COUNT"
+
+            # ----------------------------------
+            # CREATE ZIP
+            # ----------------------------------
+
+            ARCHIVE_DIR="archives/$BATCH_FOLDER"
+
+            rm -rf "$ARCHIVE_DIR"
+            mkdir -p "$ARCHIVE_DIR"
+
+            echo ""
+            echo "Creating split archive..."
+
+            cd "downloads/$BATCH_FOLDER"
+
+            # 90MB parts
+            #
+            # GitHub rejects files larger than 100MB.
+            # 90MB gives us some safety margin.
+
+            zip \
+              -0 \
+              -s 90m \
+              "../../$ARCHIVE_DIR/${BATCH_FOLDER}.zip" \
+              *.mp4 \
+              *.webm \
+              *.mkv \
+              *.mp3 \
+              *.m4a \
+              FAILED.txt \
+              2>/dev/null || true
+
+            cd ../../
+
+            # ----------------------------------
+            # CREATE README
+            # ----------------------------------
+
+            TOTAL_SIZE=$(du -sh "downloads/$BATCH_FOLDER" | cut -f1)
+
+            {
+              echo "# 📦 $BATCH_FOLDER"
+              echo ""
+              echo "---"
+              echo ""
+              echo "| Property | Value |"
+              echo "|---|---|"
+              echo "| Batch | $BATCH |"
+              echo "| Videos requested | $COUNT |"
+              echo "| Videos downloaded | $VIDEO_COUNT |"
+              echo "| Quality | $QUALITY |"
+              echo "| Download size | $TOTAL_SIZE |"
+              echo ""
+              echo "---"
+              echo ""
+              echo "## Archive"
+              echo ""
+              echo "This batch is split into multiple ZIP parts."
+              echo ""
+              echo "Download **all parts** and open the `.zip` file with 7-Zip or WinRAR."
+              echo ""
+              echo "---"
+              echo ""
+              echo "## Source Links"
+              echo ""
+
+              NUMBER=0
+
+              while IFS= read -r URL
+              do
+                NUMBER=$((NUMBER + 1))
+                echo "$NUMBER. $URL"
+              done < "/tmp/batch_${BATCH}.txt"
+
+            } > "$ARCHIVE_DIR/README.md"
+
+            # ----------------------------------
+            # SHOW ARCHIVE
+            # ----------------------------------
+
+            echo ""
+            echo "Archive files:"
+
+            ls -lh "$ARCHIVE_DIR"
+
+            echo ""
+            echo "======================================"
+            echo "BATCH $BATCH COMPLETE"
+            echo "======================================"
+
+            # ----------------------------------
+            # COPY ARCHIVE INTO REPOSITORY
+            # ----------------------------------
+
+            mkdir -p "videos/$BATCH_FOLDER"
+
+            cp "$ARCHIVE_DIR"/* \
+              "videos/$BATCH_FOLDER/"
+
+            # ----------------------------------
+            # REMOVE ORIGINAL VIDEOS
+            # ----------------------------------
+
+            rm -rf "downloads/$BATCH_FOLDER"
+
+            echo ""
+            echo "Batch $BATCH ready for GitHub."
+
+          done
+
+      # ==========================================
+      # CREATE MASTER README
+      # ==========================================
+
+      - name: Generate batch index
+        run: |
+
+          {
+            echo "# 📦 YouTube Download Batches"
+            echo ""
+            echo "---"
+            echo ""
+
+            for DIR in videos/batch_*/;
+            do
+
+              [ -d "$DIR" ] || continue
+
+              NAME=$(basename "$DIR")
+
+              echo "## 📦 $NAME"
+              echo ""
+
+              echo "[Open $NAME](./$NAME)"
+              echo ""
+
+              echo "---"
+              echo ""
+
+            done
+
+          } > videos/README.md
+
+      # ==========================================
+      # COMMIT
+      # ==========================================
+
+      - name: Commit files
+        run: |
+
+          git config user.name "github-actions"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add videos/
+
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+
+          git commit \
+            -m "[YouTube] Add downloaded batch archives [skip ci]"
+
+      # ==========================================
+      # PUSH
+      # ==========================================
+
+      - name: Push to repository
+        run: |
+
+          git push origin HEAD:${GITHUB_REF_NAME}
+
+          echo ""
+          echo "======================================"
+          echo "UPLOAD COMPLETE"
+          echo "======================================"
