@@ -1,0 +1,155 @@
+name: 🔗 YouTube Playlist Links Extractor
+
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_url:
+        description: 'YouTube Playlist URL'
+        required: true
+        type: string
+
+jobs:
+  extract-links:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install yt-dlp
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip
+          pip3 install --upgrade yt-dlp
+
+          yt-dlp --version
+
+      - name: Extract Playlist Links
+        env:
+          YOUTUBE_URL: ${{ inputs.youtube_url }}
+        run: |
+          set -e
+
+          echo "=========================================="
+          echo "YouTube Playlist Link Extractor"
+          echo "=========================================="
+          echo ""
+          echo "Playlist:"
+          echo "$YOUTUBE_URL"
+          echo ""
+
+          mkdir -p output
+
+          # ------------------------------------------
+          # Get playlist title
+          # ------------------------------------------
+
+          PLAYLIST_TITLE=$(yt-dlp \
+            --flat-playlist \
+            --print "%(playlist_title)s" \
+            --playlist-items 1 \
+            "$YOUTUBE_URL" 2>/dev/null | head -n 1 || true)
+
+          if [ -z "$PLAYLIST_TITLE" ]; then
+            PLAYLIST_TITLE="YouTube Playlist"
+          fi
+
+          echo "Playlist title: $PLAYLIST_TITLE"
+
+          # ------------------------------------------
+          # Extract video URLs
+          # ------------------------------------------
+
+          echo ""
+          echo "Extracting video links..."
+          echo ""
+
+          yt-dlp \
+            --flat-playlist \
+            --print "https://www.youtube.com/watch?v=%(id)s" \
+            "$YOUTUBE_URL" \
+            > output/playlist_links.txt
+
+          # Remove empty lines
+          sed -i '/^[[:space:]]*$/d' output/playlist_links.txt
+
+          VIDEO_COUNT=$(wc -l < output/playlist_links.txt)
+
+          echo ""
+          echo "=========================================="
+          echo "Extraction complete"
+          echo "Videos found: $VIDEO_COUNT"
+          echo "=========================================="
+
+          if [ "$VIDEO_COUNT" -eq 0 ]; then
+            echo "ERROR: No videos found."
+            exit 1
+          fi
+
+          # ------------------------------------------
+          # Create Markdown file
+          # ------------------------------------------
+
+          {
+            echo "# 🎬 $PLAYLIST_TITLE"
+            echo ""
+            echo "---"
+            echo ""
+            echo "**Playlist URL:** $YOUTUBE_URL"
+            echo ""
+            echo "**Total videos:** $VIDEO_COUNT"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Video Links"
+            echo ""
+
+            NUMBER=0
+
+            while IFS= read -r URL; do
+              NUMBER=$((NUMBER + 1))
+              echo "$NUMBER. [$URL]($URL)"
+            done < output/playlist_links.txt
+
+            echo ""
+            echo "---"
+            echo ""
+            echo "*Links extracted automatically with yt-dlp.*"
+
+          } > output/playlist_links.md
+
+          echo ""
+          echo "Files created:"
+          ls -lh output/
+
+          echo ""
+          echo "First 10 links:"
+          head -n 10 output/playlist_links.txt
+
+      - name: Commit Results
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git add output/
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit \
+            -m "[YouTube] Extract playlist links [skip ci]"
+
+          git push origin HEAD:${GITHUB_REF_NAME}
+
+          echo ""
+          echo "=========================================="
+          echo "Links saved successfully!"
+          echo "=========================================="
